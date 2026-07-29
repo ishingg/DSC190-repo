@@ -25,6 +25,19 @@ class HybridLineFollower:
       DF_MIN_BLOB_ASPECT / DF_MAX_BLOB_ASPECT - height/width gate
       DF_PID_P / DF_PID_I / DF_PID_D        - steering PID gains
       DF_PID_SAMPLE_TIME                    - None = update every frame
+      DF_SEARCH_WINDOW_PX                   - px radius (in resized-image
+                                               coords) around the last
+                                               known-good column to search
+                                               first, before falling back
+                                               to a full-frame search
+
+    Column selection is gated by DF_SEARCH_WINDOW_PX: once locked onto
+    the line, only columns within that radius of the last known-good
+    position are considered, so a transient noise blob (glare, a second
+    dash, a cone edge) elsewhere in the frame can't hijack the winning
+    column for a single frame and cause a sudden hard steer. The full
+    frame is only searched again once nothing plausible is found in the
+    window (i.e. genuinely lost).
 
     Steering is driven by simple_pid.PID (same library upstream
     DonkeyCar's LineFollower uses). simple_pid computes
@@ -44,10 +57,12 @@ class HybridLineFollower:
         self.smooth = float(g('DF_STEERING_SMOOTH', 0.5))
         self.decay_rate = float(g('DF_DECAY_RATE', 0.85))
         self.lost_stop_frames = int(g('DF_LOST_STOP_FRAMES', 30))
-        self.throttle_run = float(g('THROTTLE_INITIAL', 0.2))
-        self.throttle_slow = float(g('THROTTLE_MIN', 0.12))
+        self.throttle_run = float(g('DF_THROTTLE_RUN', 0.2))
+        self.throttle_slow = float(g('DF_THROTTLE_SLOW', 0.12))
         tp = g('DF_TARGET_PIXEL', None)
         self.target = None if tp is None else float(tp)  # None -> auto-calibrate on first good frame
+        self.search_window = int(g('DF_SEARCH_WINDOW_PX', 60))  # px radius around last-known-good col to search first
+        self.last_good_col = None  # last confirmed line position; freezes while lost, resets on full re-acquire
 
         # --- steering controller (PID, matches upstream LineFollower) ---
         self.pid = PID(
@@ -118,8 +133,25 @@ class HybridLineFollower:
         hist = mask.sum(axis=0).astype(np.float32)
         if hist.size >= 5:
             hist = np.convolve(hist, np.ones(5, np.float32) / 5.0, mode='same')
-        col = int(np.argmax(hist))
-        col_px = float(hist[col])
+
+        # search near the last known-good column first, so a transient blob
+        # elsewhere in the frame can't hijack the winner for a single frame;
+        # only fall back to a full-frame search when genuinely re-acquiring
+        if self.last_good_col is not None:
+            lo = max(0, int(self.last_good_col) - self.search_window)
+            hi = min(hist.size, int(self.last_good_col) + self.search_window + 1)
+            windowed = hist[lo:hi]
+            win_col = int(np.argmax(windowed))
+            win_px = float(windowed[win_col])
+            if win_px >= self.min_col_px:
+                col = lo + win_col
+                col_px = win_px
+            else:
+                col = int(np.argmax(hist))
+                col_px = float(hist[col])
+        else:
+            col = int(np.argmax(hist))
+            col_px = float(hist[col])
 
         if self.target is None and col_px >= self.min_col_px:
             self.target = float(col)
@@ -131,6 +163,7 @@ class HybridLineFollower:
             target_steer = float(self.pid(col))
             self.steering = self.smooth * self.steering + (1.0 - self.smooth) * target_steer
             self.lost_frames = 0
+            self.last_good_col = col
             throttle = self.throttle_run
             self._dbg = (col, col_px, error, n_blobs_total, n_blobs_kept)
         else:
